@@ -51,7 +51,6 @@ from vllm.model_executor.layers.fused_moe import GateLinear, SharedFusedMoE
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    GateLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
