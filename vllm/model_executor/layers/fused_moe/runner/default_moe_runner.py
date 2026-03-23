@@ -272,28 +272,33 @@ class DefaultMoERunner(MoERunner):
         self,
         hidden_states: torch.Tensor,
         shared_input: torch.Tensor | None,
-    ):
-        if self.use_shared_experts_stream:
-            assert self.shared_experts_stream is not None
-            assert self.moe_config.disable_inplace
+    ) -> torch.Tensor | None:
+        if not self.use_shared_experts_stream:
+            return None
 
-            shared_experts_input = (
-                shared_input if shared_input is not None else hidden_states
-            )
+        assert self.shared_experts_stream is not None
+        assert self.moe_config.disable_inplace
+        assert self.shared_experts is not None
 
-            # Record that the shared_experts_input will be used in the
-            # shared_experts_stream to avoid gc issue from
-            # deallocation. For more details:
-            # https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html # noqa: E501
-            # NOTE: We don't need shared_output.record_stream(current_stream())
-            # because we synch the streams before using shared_output.
-            shared_experts_input.record_stream(self.shared_experts_stream)
+        shared_experts_input = (
+            shared_input if shared_input is not None else hidden_states
+        )
 
-            # Mark sync start point for the separate shared experts
-            # stream here since we want to run in parallel with the
-            # router/gate (next op below)
-            assert self.shared_experts_stream is not None
-            self.shared_experts_stream.wait_stream(current_stream())
+        # Record that the shared_experts_input will be used in the
+        # shared_experts_stream to avoid gc issue from
+        # deallocation. For more details:
+        # https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html # noqa: E501
+        # NOTE: We don't need shared_output.record_stream(current_stream())
+        # because we synch the streams before using shared_output.
+        shared_experts_input.record_stream(self.shared_experts_stream)
+
+        # Set sync start point capturing all main-stream work done so far,
+        # then immediately launch shared experts so they overlap with
+        # gate/dispatch/GEMM below. The main-stream sync happens in
+        # forward_impl after the GEMM.
+        self.shared_experts_stream.wait_stream(current_stream())
+        with torch.cuda.stream(self.shared_experts_stream):
+            return self.shared_experts(shared_experts_input)
 
     def _maybe_init_dp_chunking(self):
         if not self.use_dp_chunking:
@@ -514,9 +519,16 @@ class DefaultMoERunner(MoERunner):
         else:
             hidden_states = result
 
-        if not run_shared_experts_before and self.has_separate_shared_experts:
+        # When use_shared_experts_stream is True, shared experts were already
+        # launched early in _maybe_setup_shared_experts_stream for overlap with
+        # gate/dispatch/GEMM. Don't re-launch them here.
+        if (
+            not run_shared_experts_before
+            and self.has_separate_shared_experts
+            and not self.use_shared_experts_stream
+        ):
             assert shared_output is None
-            shared_output = self._apply_shared_experts(shared_input, True)
+            shared_output = self._apply_shared_experts(shared_input, False)
 
         return shared_output, hidden_states
 
@@ -793,13 +805,12 @@ class DefaultMoERunner(MoERunner):
             self.has_separate_shared_experts and not self.use_shared_experts_stream
         )
 
-        # The shared experts stream must be set up before calling the gate so they
-        # can be overlapped.
-        if not run_shared_experts_before:
-            self._maybe_setup_shared_experts_stream(
-                hidden_states,
-                shared_input,
-            )
+        # Launch shared experts on aux stream immediately so they overlap with
+        # gate/dispatch/GEMM below. Returns None when not streaming.
+        early_shared_output = self._maybe_setup_shared_experts_stream(
+            hidden_states,
+            shared_input,
+        )
 
         router_logits = self._maybe_gate(hidden_states, router_logits)
 
@@ -812,13 +823,22 @@ class DefaultMoERunner(MoERunner):
             router_logits,
         )
 
-        shared_output, hidden_states = self._apply_quant_method(
+        quant_shared_output, hidden_states = self._apply_quant_method(
             layer=layer,
             hidden_states=hidden_states,
             router_logits=router_logits,
             shared_input=shared_input,
             run_shared_experts_before=run_shared_experts_before,
         )
+
+        # Sync main stream with aux after GEMM so shared experts and GEMM
+        # truly overlapped. Use whichever shared output was produced.
+        if early_shared_output is not None:
+            assert self.shared_experts_stream is not None
+            current_stream().wait_stream(self.shared_experts_stream)
+            shared_output = early_shared_output
+        else:
+            shared_output = quant_shared_output
 
         return self._maybe_combine(
             shared_output,
