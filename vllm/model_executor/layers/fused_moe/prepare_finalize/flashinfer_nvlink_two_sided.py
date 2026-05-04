@@ -43,7 +43,7 @@ class FlashInferNVLinkTwoSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         return self.num_dispatchers_
 
     def output_is_reduced(self) -> bool:
-        return False
+        return True
 
     def _apply_router_weight_on_input(
         self,
